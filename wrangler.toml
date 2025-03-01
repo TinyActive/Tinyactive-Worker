@@ -17,7 +17,7 @@ custom_domain = true
 mode = "smart"
 
 [[kv_namespaces]]
-id = "462f6b025fe2411f817c3dab5d03b178"
+id = "2495644a445c4566972ef002e0845d8d"
 binding = "EDGE_CACHE"
 
 [[services]]
