@@ -1,6 +1,18 @@
-// Yêu cầu: Một KV Namespace phải được bind với worker script này bằng biến EDGE_CACHE.
+import { Redis } from '@upstash/redis';
 
-// Default cookie prefixes for bypass
+// Khởi tạo client Upstash Redis từ biến môi trường được Cloudflare cung cấp
+let upstashRedisClient = null;
+if (
+  typeof UPSTASH_REDIS_REST_URL !== 'undefined' &&
+  typeof UPSTASH_REDIS_REST_TOKEN !== 'undefined'
+) {
+  upstashRedisClient = new Redis({
+    url: UPSTASH_REDIS_REST_URL,
+    token: UPSTASH_REDIS_REST_TOKEN,
+  });
+}
+
+// Default cookie prefixes cho bypass cache
 const DEFAULT_BYPASS_COOKIES = ['wp-', 'wordpress', 'comment_', 'woocommerce_'];
 
 /**
@@ -10,36 +22,27 @@ addEventListener('fetch', event => {
   const request = event.request;
   let upstreamCache = request.headers.get('x-HTML-Edge-Cache');
 
-  // Chỉ xử lý request khi đã bind KV (EDGE_CACHE) và không có HTML edge cache ở phía trước worker
-  const configured = (typeof EDGE_CACHE !== 'undefined');
-
-  // Nếu muốn loại trừ ảnh, bạn có thể kiểm tra Accept, ví dụ:
-  // const accept = request.headers.get('Accept');
-  // let isImage = accept && accept.indexOf('image/*') !== -1;
-  // Tuy nhiên, nếu bạn muốn xử lý toàn bộ header Accept bất kể là gì,
-  // ta bỏ qua điều kiện loại trừ cho hình ảnh.
-  
-  if (configured && upstreamCache === null) {
+  // Sử dụng Upstash Redis để quản lý cache (nếu đã cấu hình)
+  if (upstashRedisClient && !upstreamCache) {
     event.passThroughOnException();
     event.respondWith(processRequest(request, event));
   }
 });
 
 /**
- * Process every request coming through to add the edge-cache header,
- * watch for purge responses and possibly cache GET requests (đối với tất cả các Accept header).
- *
- * @param {Request} originalRequest - Original request
- * @param {Event} event - Original event (for additional async waiting)
+ * Xử lý các request:
+ * - Kiểm tra cache từ Upstash Redis
+ * - Nếu không có cache, gửi request đến origin, kiểm tra lệnh purge và lưu cache (nếu cần)
+ * - Thêm header kiểm tra trạng thái của worker và kết nối Upstash Redis.
  */
 async function processRequest(originalRequest, event) {
   let cfCacheStatus = null;
-  // Lấy header Accept nhưng không dùng để lọc loại nội dung
   const accept = originalRequest.headers.get('Accept');
+  const isHTML = accept && accept.indexOf('text/html') >= 0;
   let { response, cacheVer, status, bypassCache } = await getCachedResponse(originalRequest);
 
   if (response === null) {
-    // Clone request, thêm header edge-cache và gửi đi.
+    // Gửi request đến origin với header thông báo hỗ trợ cache
     let request = new Request(originalRequest);
     request.headers.set('x-HTML-Edge-Cache', 'supports=cache|purgeall|bypass-cookies');
     response = await fetch(request);
@@ -53,6 +56,7 @@ async function processRequest(originalRequest, event) {
       bypassCache = bypassCache || shouldBypassEdgeCache(request, response);
       if (
         (!options || options.cache) &&
+        isHTML &&
         originalRequest.method === 'GET' &&
         response.status === 200 &&
         !bypassCache
@@ -61,9 +65,9 @@ async function processRequest(originalRequest, event) {
       }
     }
   } else {
-    // Nếu có cached response, thực hiện stale-while-revalidate.
+    // Nếu đã có cache, dùng stale-while-revalidate
     cfCacheStatus = 'HIT';
-    if (originalRequest.method === 'GET' && response.status === 200) {
+    if (originalRequest.method === 'GET' && response.status === 200 && isHTML) {
       bypassCache = bypassCache || shouldBypassEdgeCache(originalRequest, response);
       if (!bypassCache) {
         const options = getResponseOptions(response);
@@ -79,7 +83,8 @@ async function processRequest(originalRequest, event) {
     response &&
     status !== null &&
     originalRequest.method === 'GET' &&
-    response.status === 200
+    response.status === 200 &&
+    isHTML
   ) {
     response = new Response(response.body, response);
     response.headers.set('x-HTML-Edge-Cache-Status', status);
@@ -89,26 +94,30 @@ async function processRequest(originalRequest, event) {
     if (cfCacheStatus) {
       response.headers.set('CF-Cache-Status', cfCacheStatus);
     }
-    // Header báo hiệu Worker đang hoạt động.
-    response.headers.set('x-worker-health', 'active');
-    // Header cho biết nguồn của dữ liệu: "cache" nếu cache hit, ngược lại "origin"
-    response.headers.set('x-cache-source', cfCacheStatus === 'HIT' ? 'cache' : 'origin');
+  }
+
+  // Thêm header kiểm tra hoạt động của worker và trạng thái kết nối với Upstash Redis
+  response = new Response(response.body, response);
+  response.headers.set('x-worker-status', 'OK');
+  if (upstashRedisClient) {
+    try {
+      const ping = await upstashRedisClient.ping();
+      response.headers.set('x-upstash-status', ping === 'PONG' ? 'OK' : 'Error');
+    } catch (e) {
+      response.headers.set('x-upstash-status', 'Error');
+    }
+  } else {
+    response.headers.set('x-upstash-status', 'Not Configured');
   }
 
   return response;
 }
 
 /**
- * Determine if the cache should be bypassed for the given request/response pair.
- * Nếu request chứa cookie khớp với bypass, sẽ trả về true.
- *
- * @param {Request} request - Request
- * @param {Response} response - Response
- * @returns {bool} true nếu cần bypass cache.
+ * Kiểm tra xem có cần bypass cache không dựa trên các cookie trong request.
  */
 function shouldBypassEdgeCache(request, response) {
   let bypassCache = false;
-
   if (request && response) {
     const options = getResponseOptions(response);
     const cookieHeader = request.headers.get('cookie');
@@ -129,55 +138,36 @@ function shouldBypassEdgeCache(request, response) {
       }
     }
   }
-
   return bypassCache;
 }
 
-const CACHE_HEADERS = ['Cache-Control', 'Expires', 'Pragma'];
-
 /**
- * Check for cached GET requests.
- *
- * @param {Request} request - Original request
+ * Kiểm tra cache cho các request GET HTML bằng cách truy xuất từ Upstash Redis.
  */
 async function getCachedResponse(request) {
   let response = null;
-  let cacheVer = null;
+  let cacheVer = await GetCurrentCacheVersion(null);
   let bypassCache = false;
   let status = 'Miss';
-
+  const accept = request.headers.get('Accept');
   const cacheControl = request.headers.get('Cache-Control');
   let noCache = false;
   if (cacheControl && cacheControl.indexOf('no-cache') !== -1) {
     noCache = true;
     status = 'Bypass for Reload';
   }
-  if (!noCache && request.method === 'GET') {
-    // Tạo URL có phiên bản cho cache
-    cacheVer = await GetCurrentCacheVersion(cacheVer);
-    const cacheKeyRequest = GenerateCacheRequest(request, cacheVer);
-
+  if (!noCache && request.method === 'GET' && accept && accept.indexOf('text/html') >= 0) {
+    const cacheKey = GenerateCacheKey(request, cacheVer);
     try {
-      let cache = caches.default;
-      let cachedResponse = await cache.match(cacheKeyRequest);
-      if (cachedResponse) {
-        cachedResponse = new Response(cachedResponse.body, cachedResponse);
-        bypassCache = shouldBypassEdgeCache(request, cachedResponse);
-        if (bypassCache) {
-          status = 'Bypass Cookie';
-        } else {
-          status = 'Hit';
-          cachedResponse.headers.delete('Cache-Control');
-          cachedResponse.headers.delete('x-HTML-Edge-Cache-Status');
-          for (let header of CACHE_HEADERS) {
-            let value = cachedResponse.headers.get('x-HTML-Edge-Cache-Header-' + header);
-            if (value) {
-              cachedResponse.headers.delete('x-HTML-Edge-Cache-Header-' + header);
-              cachedResponse.headers.set(header, value);
-            }
-          }
-          response = cachedResponse;
-        }
+      const cached = await upstashRedisClient.get(cacheKey);
+      if (cached) {
+        let cachedObj = JSON.parse(cached);
+        response = new Response(cachedObj.body, {
+          status: cachedObj.status,
+          headers: cachedObj.headers,
+        });
+        bypassCache = shouldBypassEdgeCache(request, response);
+        status = bypassCache ? 'Bypass Cookie' : 'Hit';
       } else {
         status = 'Miss';
       }
@@ -185,38 +175,61 @@ async function getCachedResponse(request) {
       status = 'Cache Read Exception: ' + err.message;
     }
   }
-
   return { response, cacheVer, status, bypassCache };
 }
 
 /**
- * Asynchronously purge the cache bằng cách tăng cache version.
- *
- * @param {Int} cacheVer - Cache version hiện tại.
- * @param {Event} event - Original event
+ * Lưu trữ response HTML GET thành công vào Upstash Redis.
  */
-async function purgeCache(cacheVer, event) {
-  if (typeof EDGE_CACHE !== 'undefined') {
+async function cacheResponse(cacheVer, request, originalResponse, event) {
+  let status = '';
+  const accept = request.headers.get('Accept');
+  if (
+    request.method === 'GET' &&
+    originalResponse.status === 200 &&
+    accept &&
+    accept.indexOf('text/html') >= 0
+  ) {
     cacheVer = await GetCurrentCacheVersion(cacheVer);
-    cacheVer++;
-    event.waitUntil(EDGE_CACHE.put('html_cache_version', cacheVer.toString()));
+    const cacheKey = GenerateCacheKey(request, cacheVer);
+    try {
+      const clone = originalResponse.clone();
+      const bodyText = await clone.text();
+      let headersObj = {};
+      clone.headers.forEach((value, key) => {
+        headersObj[key] = value;
+      });
+      const cacheObj = {
+        status: clone.status,
+        headers: headersObj,
+        body: bodyText,
+      };
+      event.waitUntil(upstashRedisClient.set(cacheKey, JSON.stringify(cacheObj)));
+      status = ', Cached';
+    } catch (err) {
+      // Có thể log lỗi nếu cần: err.message
+    }
   }
+  return status;
 }
 
 /**
- * Cập nhật cached copy của trang.
- *
- * @param {Request} originalRequest - Original request
- * @param {String} cacheVer - Cache version
- * @param {Event} event - Original event
+ * Purge cache bằng cách tăng phiên bản cache trong Upstash Redis.
+ */
+async function purgeCache(cacheVer, event) {
+  cacheVer = await GetCurrentCacheVersion(cacheVer);
+  cacheVer++;
+  event.waitUntil(upstashRedisClient.set('html_cache_version', cacheVer.toString()));
+}
+
+/**
+ * Cập nhật cache một cách không đồng bộ (stale-while-revalidate).
  */
 async function updateCache(originalRequest, cacheVer, event) {
   let request = new Request(originalRequest);
   request.headers.set('x-HTML-Edge-Cache', 'supports=cache|purgeall|bypass-cookies');
   let response = await fetch(request);
-
   if (response) {
-    let status = ': Fetched';
     const options = getResponseOptions(response);
     if (options && options.purge) {
       await purgeCache(cacheVer, event);
@@ -229,54 +242,7 @@ async function updateCache(originalRequest, cacheVer, event) {
 }
 
 /**
- * Cache nội dung trả về (chỉ đối với GET request thành công).
- *
- * @param {Int} cacheVer - Cache version hiện tại.
- * @param {Request} request - Original request
- * @param {Response} originalResponse - Response cần cache
- * @param {Event} event - Original event
- * @returns {String} trạng thái cache (ví dụ: ', Cached')
- */
-async function cacheResponse(cacheVer, request, originalResponse, event) {
-  let status = '';
-  if (
-    request.method === 'GET' &&
-    originalResponse.status === 200
-  ) {
-    cacheVer = await GetCurrentCacheVersion(cacheVer);
-    const cacheKeyRequest = GenerateCacheRequest(request, cacheVer);
-
-    try {
-      let cache = caches.default;
-      let clonedResponse = originalResponse.clone();
-      let response = new Response(clonedResponse.body, clonedResponse);
-      for (let header of CACHE_HEADERS) {
-        let value = response.headers.get(header);
-        if (value) {
-          response.headers.delete(header);
-          response.headers.set('x-HTML-Edge-Cache-Header-' + header, value);
-        }
-      }
-      response.headers.delete('Set-Cookie');
-      response.headers.set('Cache-Control', 'public; max-age=315360000');
-      event.waitUntil(cache.put(cacheKeyRequest, response));
-      status = ', Cached';
-    } catch (err) {
-      // Có thể log lỗi: err.message
-    }
-  }
-  return status;
-}
-
-/******************************************************************************
- * Utility Functions
- *****************************************************************************/
-
-/**
- * Parse các lệnh từ header x-HTML-Edge-Cache trong response.
- *
- * @param {Response} response - HTTP response từ origin.
- * @returns {*} Lệnh đã parse.
+ * Phân tích header của response từ origin để xác định lệnh cache, purge và bypass cookies.
  */
 function getResponseOptions(response) {
   let options = null;
@@ -311,36 +277,25 @@ function getResponseOptions(response) {
 }
 
 /**
- * Lấy cache version hiện tại từ KV.
- *
- * @param {Int} cacheVer - Giá trị cache version hiện tại nếu có.
- * @returns {Int} Cache version hiện tại.
+ * Lấy phiên bản cache hiện tại từ Upstash Redis.
  */
 async function GetCurrentCacheVersion(cacheVer) {
   if (cacheVer === null) {
-    if (typeof EDGE_CACHE !== 'undefined') {
-      cacheVer = await EDGE_CACHE.get('html_cache_version');
-      if (cacheVer === null) {
-        cacheVer = 0;
-        await EDGE_CACHE.put('html_cache_version', cacheVer.toString());
-      } else {
-        cacheVer = parseInt(cacheVer);
-      }
+    cacheVer = await upstashRedisClient.get('html_cache_version');
+    if (cacheVer === null) {
+      cacheVer = 0;
+      await upstashRedisClient.set('html_cache_version', cacheVer.toString());
     } else {
-      cacheVer = -1;
+      cacheVer = parseInt(cacheVer);
     }
   }
   return cacheVer;
 }
 
 /**
- * Tạo Request có phiên bản để sử dụng trong cache operations.
- *
- * @param {Request} request - Request gốc
- * @param {Int} cacheVer - Cache version hiện tại (phải có)
- * @returns {Request} Request đã được version hóa.
+ * Tạo key cache dựa trên URL request và phiên bản cache.
  */
-function GenerateCacheRequest(request, cacheVer) {
+function GenerateCacheKey(request, cacheVer) {
   let cacheUrl = request.url;
   if (cacheUrl.indexOf('?') >= 0) {
     cacheUrl += '&';
@@ -348,5 +303,5 @@ function GenerateCacheRequest(request, cacheVer) {
     cacheUrl += '?';
   }
   cacheUrl += 'cf_edge_cache_ver=' + cacheVer;
-  return new Request(cacheUrl);
+  return 'cf_edge_cache:' + cacheUrl;
 }
